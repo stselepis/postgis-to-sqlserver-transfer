@@ -3,14 +3,18 @@ from numpy.core.defchararray import startswith
 from sqlalchemy import create_engine, text
 import pyodbc, os
 from shapely.geometry.base import BaseGeometry
+from shapely import wkt
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
 import geopandas as gpd, pandas as pd
 import traceback, logging
+from datetime import datetime
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.geometry.polygon import orient
 import math
 from typing import Union, List
+import warnings
+warnings.filterwarnings('ignore')
 # Load environment variables from .env
 load_dotenv()
 
@@ -28,6 +32,43 @@ sql_server_conn_str = ("DRIVER={ODBC Driver 17 for SQL Server};"
     "DATABASE=ais;"
     f"UID=kp_daan;PWD={os.getenv('SQL_SERVER_PASSWORD')}")
 
+# +
+# create timestamped SQL log file
+log_dir = "./logs"  #
+os.makedirs(log_dir, exist_ok=True)
+sql_log_path = os.path.join(log_dir, f"sql_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql")
+
+# helper function to log SQL queries
+def log_sql(sql):
+    sql = sql.strip()
+    if not sql.endswith(";"):
+        sql += ";"
+    with open(sql_log_path, "a") as f:
+        f.write(sql + "\n")
+
+def format_sql(sql, values):
+    try:
+        parts = sql.split("?")
+        if len(parts) - 1 != len(values):
+            return f"-- placeholder count mismatch: {sql} {values}"
+        
+        interpolated = parts[0]
+        for part, val in zip(parts[1:], values):
+            if val is None:
+                interpolated += "NULL"  # SQL null
+            elif isinstance(val, str):
+                interpolated += f"'{val}'"  # wrap strings in quotes
+            else:
+                interpolated += str(val)  # numbers, etc.
+            interpolated += part
+
+        return interpolated
+    except Exception as e:
+        return f"-- failed to format: {sql} {values} ({e})"
+
+
+# -
+
 # --- Create PostgreSQL engine ---
 pg_url = (
     f"postgresql://{pg_config['username']}:{pg_config['password']}@"
@@ -39,6 +80,206 @@ pg_engine = create_engine(pg_url)
 sql_conn = pyodbc.connect(sql_server_conn_str)
 print("Autocommit:", sql_conn.autocommit)
 sql_cur = sql_conn.cursor()
+
+
+
+
+
+
+
+
+
+
+
+# Function that copies in PG sandbox tables those MT ports, and their terminals and berths, that are going to be deleted
+def backup_from_MT_to_PG(port_list = None):
+    print("Starting backup...")
+    if isinstance(port_list, list):
+        id_str = ', '.join(str(i) for i in port_list)
+        sql_where = f'zone_id in ({id_str})'
+    else:
+        sql_where = '1=1'
+
+    # From list of PG port_ids to list of MT port_ids
+    port_matching_query = f"""
+    select zone_id, mt_id
+    from sandbox.mview_master_ports where {sql_where}
+    """        
+    df_matched_mt_ports = pd.read_sql(
+        sql = port_matching_query,
+        con = pg_engine)
+    
+    mt_port_ids = list(df_matched_mt_ports.dropna()['mt_id'].astype('Int64'))
+    
+    if len(mt_port_ids) > 0:
+        id_str = ', '.join(str(i) for i in mt_port_ids)
+        sql_where = f'port_id in ({id_str})'
+        
+        # Ports to be backed up (with R_PORT_ALTNAMES as a column separated with "|")
+        mt_Port_query = f"""
+        select 
+            p.port_id, 
+            p.port_name, 
+            p.port_type,
+            p.country_code,
+            p.unlocode,
+            p.related_anch_id, 
+            p.related_port_id, 
+            p.moving_ship_id, 
+            p.sw_x, p.sw_y, p.ne_x, p.ne_y, p.centerx, p.centery,
+            p.altname1, p.altname2, p.altname3, p.altname4,
+            al.r_port_altnames_sep,  -- alias names | separated
+            p.confirmed,
+            p.enable_calls,
+            p.polygon.STAsText() as geometry
+        from dbo.ports p
+        left join (
+            select 
+                port_id,
+                string_agg(alias_name, '|') as r_port_altnames_sep
+            from dbo.r_port_altnames
+            group by port_id
+        ) al on al.port_id = p.port_id
+        where p.{sql_where}
+        """
+        
+        df = pd.read_sql_query(mt_Port_query, sql_conn)
+        if not df.empty: # mt_port_ids list may contain already deleted ports
+            ## to geodataframe
+            df['geometry'] = df['geometry'].apply(wkt.loads)
+            gdf = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
+            
+            ## all column names to lowercase
+            gdf.columns = [col.lower() for col in gdf.columns]
+
+            ## fix id references =-1
+            gdf['related_anch_id'] = gdf['related_anch_id'].apply(lambda x: None if x == -1 else x)
+            gdf['related_port_id'] = gdf['related_port_id'].apply(lambda x: None if x == -1 else x)
+            
+            ## Upload to PG sandbox
+            gdf.to_postgis(
+                name="mt_deleted_ports",  
+                con=pg_engine,
+                schema="sandbox", 
+                if_exists="append",
+                index=False)
+            
+        print('📤 Ports backed up:', len(df))
+
+        # Terminals to be backed up
+        mt_terminal_query = f"""
+        select 
+        	TERMINAL_ID,
+        	TERMINAL_NAME,
+        	PORT_ID
+        from dbo.port_terminals 
+        where {sql_where}
+        or TERMINAL_ID in (select TERMINAL_ID from dbo.port_berths where {sql_where})
+        """
+        
+        df = pd.read_sql_query(mt_terminal_query, sql_conn)
+        if not df.empty:
+            ## all column names to lowercase
+            df.columns = [col.lower() for col in df.columns]
+            
+            ## Upload to PG sandbox
+            df.to_sql(
+                name="mt_deleted_terminals",
+                con=pg_engine,
+                schema="sandbox",
+                if_exists="append",
+                index=False)
+            
+        print('📤 Terminals backed up:', len(df))
+
+        # Berths to be backed up
+        mt_berth_query = f"""
+        select 
+        	BERTH_ID,
+        	BERTH_NAME,
+        	PORT_ID,
+        	TERMINAL_ID,
+        	MAX_LENGTH,
+        	MAX_DRAUGHT,
+        	MAX_BREADTH,
+        	LIFTING_GEAR,
+        	BULK_CAPACITY,
+        	DESCRIPTION,
+        	MAX_TIDAL_DRAUGHT,
+        	AIS_MAX_LENGTH,
+        	AIS_MAX_BREADTH,
+        	AIS_MAX_DRAUGHT,
+        	MAX_DEADWEIGHT,
+        	POLYGON.STAsText() as geometry
+        from dbo.port_berths 
+        where {sql_where}
+        """
+        
+        df = pd.read_sql_query(mt_berth_query, sql_conn)
+        if not df.empty: 
+            ## Fix terminal_id not integer
+            df['TERMINAL_ID'] = df['TERMINAL_ID'].astype('Int64')
+            ## to geodataframe
+            df['geometry'] = df['geometry'].apply(wkt.loads)
+            gdf = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
+            ## all column names to lowercase
+            gdf.columns = [col.lower() for col in gdf.columns]
+            ## Upload to PG sandbox
+            gdf.to_postgis(
+                name="mt_deleted_berths",  
+                con=pg_engine,
+                schema="sandbox", 
+                if_exists="append",
+                index=False)
+            
+        print('📤 Berths backed up:', len(df))
+
+    else:
+        print('📤 Ports backed up: 0')
+        print('📤 Terminals backed up: 0')
+        print('📤 Berths backed up: 0')
+    return 
+
+
+# Function that deletes the MT ports, and their terminals and berths, if matched with given list of PG ports (zone_ids)
+def delete_from_MT(port_list = None):
+    print("Starting deletions...")
+    if isinstance(port_list, list):
+        id_str = ', '.join(str(i) for i in port_list)
+        sql_where = f'zone_id in ({id_str})'
+    else:
+        sql_where = '1=1'
+
+    # From list of PG port_ids to list of MT port_ids
+    port_matching_query = f"""
+    select zone_id, mt_id
+    from sandbox.mview_master_ports where {sql_where}
+    """        
+    df_matched_mt_ports = pd.read_sql(
+        sql = port_matching_query,
+        con = pg_engine)
+    
+    mt_port_ids = list(df_matched_mt_ports.dropna()['mt_id'].astype('Int64'))
+    
+    if len(mt_port_ids) > 0:
+        id_str = ', '.join(str(i) for i in mt_port_ids)
+        sql_where = f'port_id in ({id_str})'
+        queries  = [
+            (f"delete from dbo.ports where {sql_where}", "ports"),
+            (f"delete from dbo.R_PORT_ALTNAMES where {sql_where}", "r_port_altnames"),
+            (f"delete from dbo.port_terminals where {sql_where} or terminal_id in (select TERMINAL_ID from dbo.port_berths where {sql_where})", "port_terminals"),
+            (f"delete from dbo.port_berths where {sql_where}", "port_berths")]
+        
+        for query, label in queries:
+            log_sql(query)
+            sql_cur.execute(query)
+            print(f"🗑️ Deleted from {label}: {sql_cur.rowcount}")
+        #sql_conn.commit() # Should we commit here?
+    else:
+        print('No deletions')
+
+    return
+
 
 #Fix target value (character limit, mappings)
 def fix_target_value(target_field, value):
@@ -134,9 +375,7 @@ def upload_gdf_to_sqlserver(gdf, mapping_fields, target_table, use_identity_inse
     print(f"Updating {target_table}...")
     insert_sql = f"""
     INSERT INTO {target_table} ({', '.join(mapping_fields.values())})
-    --OUTPUT INSERTED.PORT_ID
     VALUES ({', '.join(['?'] * len(mapping_fields))});
-    SELECT SCOPE_IDENTITY();
     """
     #Set counter
     failed_rows = 0
@@ -146,7 +385,9 @@ def upload_gdf_to_sqlserver(gdf, mapping_fields, target_table, use_identity_inse
         # Check if mt_id is not null
         if use_identity_insert:
             print(f"SET IDENTITY_INSERT {target_table} ON")
-            sql_cur.execute(f"SET IDENTITY_INSERT {target_table} ON;")
+            sql = f"SET IDENTITY_INSERT {target_table} ON;"
+            log_sql(sql)
+            sql_cur.execute(sql)
 
         for idx, row in gdf.iterrows():
             values = []
@@ -162,16 +403,18 @@ def upload_gdf_to_sqlserver(gdf, mapping_fields, target_table, use_identity_inse
                 current_row_data[target_field] = value
             #print(f"Preparing to insert into {target_table}: {dict(zip(mapping_fields.values(), values))}")
             try:
+                log_sql(format_sql(insert_sql, values))
                 sql_cur.execute(insert_sql, *values)
                 if return_identity_mapping  and not use_identity_insert:
                     if target_table == 'dbo.PORTS':
                         #PORTS-try to get the ID of the inserted record by matching the polygons
-                        sql_cur.execute(f"""
+                        sql = f"""
                             SELECT port_id
                             FROM {target_table}
                             WHERE POLYGON.STEquals(geography::STGeomFromText(?, 4326)) = 1
                             ORDER BY port_id DESC
-                        """, (values[-1],))  # assuming geometry is the last field
+                            """
+                        sql_cur.execute(sql, (values[-1],))  # assuming geometry is the last field
                     elif target_table == 'dbo.PORT_TERMINALS':
                         #TERMINALS-TRY TO GET THE id OF THE INSERTED RECORD BY MATCHING NAME & port_id
                         sql = f"""SELECT terminal_id FROM {target_table} WHERE TERMINAL_NAME = '{values[0]}' AND PORT_ID = {int(values[1])}
@@ -198,8 +441,10 @@ def upload_gdf_to_sqlserver(gdf, mapping_fields, target_table, use_identity_inse
                 continue  # Skip this bad row and continue
 
         if use_identity_insert:
-            print(f" SET IDENTITY_INSERT {target_table} OFF")
-            sql_cur.execute(f"SET IDENTITY_INSERT {target_table} OFF;")
+            sql = f" SET IDENTITY_INSERT {target_table} OFF;"
+            print(sql)
+            log_sql(sql)
+            sql_cur.execute(sql)
         # Commit changes
         sql_conn.commit()
         print(f"Uploaded {len(gdf) - failed_rows} successful records to {target_table}")
@@ -391,6 +636,7 @@ def update_ports(port_list = None):
         # insert rows one by one
         for _, row in df_alias.iterrows():
             if pd.notna(row['mt_id']) and pd.notna(row['alias_name']):
+                log_sql(format_sql(insert_query, [int(row['mt_id']), row['alias_name']]))
                 sql_cur.execute(insert_query, int(row['mt_id']), row['alias_name'])
         
         # commit after all inserts
@@ -706,11 +952,25 @@ def update_terminals(port_list = None):
         traceback.print_exc()
 
 # --- MAIN ---
-Port_testing_list = [1, 186587]
+Port_testing_list = [178590]
 #mt_port_list = [117,122,134,137,170,262,373,377,794,883,919,970,1253,1459,1505,2715,2745,18411,22221,22264]
+
+# +
+# --- Connect to SQL Server ---
+sql_conn = pyodbc.connect(sql_server_conn_str)
+print("Autocommit:", sql_conn.autocommit)
+sql_cur = sql_conn.cursor()
+
+# create timestamped SQL log file
+log_dir = "./logs"  #
+os.makedirs(log_dir, exist_ok=True)
+sql_log_path = os.path.join(log_dir, f"sql_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql")
+
 
 if __name__ == "__main__":
     try:
+        backup_from_MT_to_PG(Port_testing_list)
+        delete_from_MT(Port_testing_list)
         update_ports(Port_testing_list)
         update_terminals(Port_testing_list)
         update_berths(Port_testing_list)
@@ -719,5 +979,6 @@ if __name__ == "__main__":
         sql_cur.close()
         sql_conn.close()
         print("SQL Server connection closed.")
+# -
 
 
