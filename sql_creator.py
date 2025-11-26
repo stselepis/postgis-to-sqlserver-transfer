@@ -199,6 +199,47 @@ def check_sandbox_mt_same():
     return [gdf_p_diff, gdf_b_diff]
 
 
+def mt_ports_intersecting_not_included(port_zone_id_list):
+    if isinstance(port_zone_id_list, list):
+        id_str = ', '.join(str(i) for i in port_zone_id_list)
+    else:
+        raise ValueError(f"No zone_id list")
+    q = f"""
+    with mt_ports as (
+    	select "PORT_ID" as port_id, "PORT_NAME" as port_name, geometry
+    	from sandbox."MT_Ports"
+    	where "CONFIRMED" = True
+    	and "MOVING_SHIP_ID" is null
+    ),
+    matched_ports as (
+    	select mt_id as port_id, zone_id as matched_zone_id
+    	from sandbox.mview_mt_matching
+    	where mt_table = 'ports'
+    ),
+    mt_ports_matched as (
+    	select p.*, m.matched_zone_id
+    	from mt_ports p
+    	left join matched_ports m on m.port_id = p.port_id 
+    ),
+    port_zone_list as (
+    	select zone_id as overlap_zone_id, polygon_geom
+    	from geospatial.zones z 
+    	where zone_id in ({id_str})
+    )
+    select a.port_id, a.port_name, a.matched_zone_id, b.overlap_zone_id 
+    from mt_ports_matched a
+    JOIN port_zone_list b ON ST_Intersects(a.geometry, b.polygon_geom) AND NOT ST_Touches(a.geometry, b.polygon_geom)
+    where a.matched_zone_id not in ({id_str}) or a.matched_zone_id is null
+    """
+    pg_engine = create_engine(pg_url)
+    df = pd.read_sql(
+        sql = q,
+        con = pg_engine)
+    pg_engine.dispose()
+    df['matched_zone_id'] = df['matched_zone_id'].astype('Int64')
+    return df.reset_index(drop=True)
+
+
 # PG reads
 # PG ports
 def read_PG_ports(port_list = None):
@@ -285,11 +326,13 @@ def read_PG_ports(port_list = None):
         port_type = row['port_type']
         if not isinstance(name, str) or name is None:  # skip non-strings/NaN/None
             return name
-        # apply type-specific replacements
+        # apply type-specific replacements #bookmark
         if port_type == 'P':
             name = name.replace(" PORT", "")  # drop ' PORT'
         elif port_type == 'A':
             name = name.replace("ANCHORAGE", "ANCH")  # shorten anchorage
+        elif port_type == 'M':
+            name = name.replace(" MARINA", "")  # shorten anchorage
         elif port_type == 'T':
             name = name.replace(" OT", "")  # drop ' OT'
         return name        
@@ -1022,38 +1065,61 @@ print(next_ids)
 
 
 # Check if sandbox mt tables and mt target instance tables have differences on ids and geoms
-diff_ids = check_sandbox_mt_same() #bookmark
+diff_ids = check_sandbox_mt_same()
 
-diff_ids[1]
+diff_ids[0]
 
 # +
 # one-liner save
-# pd.Series(port_zone_id_list).to_csv("temp.csv", index=False)
+#pd.Series(port_zone_id_list).to_csv("all_inserts_updates.csv", index=False)
 # -
 
 # one-liner load
-port_zone_id_list = list(pd.read_csv("all_only_inserts.csv")['0'])
-len(port_zone_id_list)
+port_zone_id_list = list(pd.read_csv("all_inserts_updates.csv")['0']) + [195321]
+len(port_zone_id_list) #bookmark
 
 # +
-# target ports existing
-not_existing = []
-existing = []
-warning1 = []
-warning2 = []
-minus1 = []
-minus2 = []
-minus3 = []
+# load from gsheet
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# combine everything into one big list
-combined = not_existing + existing + warning1 + warning2
+# gdrive file
+scope = ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/spreadsheets",
+         "https://www.googleapis.com/auth/drive.file",
+         "https://www.googleapis.com/auth/drive"]
 
-# remove unwanted items
-to_remove = minus1 + minus2 +minus3
-port_zone_id_list = [x for x in combined if x not in to_remove]
+# Use the JSON key file to create credentials
+creds = ServiceAccountCredentials.from_json_keyfile_name('C:/Users/Fotis Fytanidis/Documents/python/data/analysis8888lotr-4f8092b9b2e2.json', scope)
+client = gspread.authorize(creds)
 
+# Open the Google Sheet
+sheet = client.open("ptb_metrics_all_time").worksheet("temp1")
 
+# Read the data into a pandas DataFrame
+df_list = pd.DataFrame(sheet.get_all_records())
+
+port_zone_id_list = list(df_list['zone_id'])
 print('Port list count:', len(port_zone_id_list))
+
+# +
+# zone_ids of PG ports to transfer (insert/update)
+port_zone_id_list = [22125, 180769, 185386, 185755, 186426, 186429, 186451, 186567, 186569, 188156, 196446, 212666, 214008, 214012, 214015, 214023, 214028, 214093, 214106, 214112, 214117, 214123, 214126, 214132, 214148, 214153, 214158, 214165, 214166, 214175, 214179, 214182, 214192, 214195, 214198, 214201, 214205, 214208, 214209, 214214, 214232, 214235, 214238, 214246, 214249, 214253, 214269, 214270, 214275, 214278, 214281, 214303, 214306, 214310, 214315, 214339, 214342, 214349, 214359, 214360, 214366, 214373, 214377, 214381, 214384, 214389, 214393, 214397, 214407, 214408, 214409, 214410, 214417, 214425, 214426, 214431, 214432, 214570, 214571, 214572, 214576, 214585, 214586, 214587, 214588, 214589, 214597, 214600, 214603, 214604, 214605, 214612, 214615, 214618, 214622, 214625, 214630, 214633, 214636, 214641, 214646, 214649, 214660, 214663, 214666, 214670, 214673, 214676, 214679, 214682, 214685, 214688, 214732, 214773, 214776, 214782, 214785, 214804, 214807, 214816, 214817, 214821, 214824, 214829, 214846, 214849, 214852, 214855, 214860, 214863, 214868, 214871, 214874, 214877, 214880, 214883, 214888, 214891, 214894, 214914, 214924, 214928, 214937, 214941, 214942, 214945, 214953, 214957, 214960, 214963, 214966, 214969, 214979, 214982, 214988, 215002, 215006, 215009, 215014, 215020, 215021, 215026, 215031, 215034, 215037, 215040, 215043, 215048, 215053, 215056, 215060, 215065, 215069, 215072, 215078, 215079, 215080, 215081, 215142, 215143, 215144, 215147, 215150, 215151, 215156, 215157, 215159, 18976, 2557, 14798, 19043, 2160, 2167, 2170, 2550, 2551, 2561, 2570, 14681, 14694, 14697, 14698, 14699, 14700, 14701, 14702, 14704, 14705, 14710, 14714, 14792, 14795, 14796, 14797, 16387, 16391, 16511, 16514, 16515, 16523, 16537, 16539, 16540, 16572, 16654, 16826, 16827, 18708, 18722, 18789, 18917, 18975, 18980, 19024, 19066, 19071, 19076, 19079, 19080, 19090, 19093, 19193, 19280, 19282, 19329, 19606, 183229, 185791, 186268, 195972
+]
+
+# from craig's task
+port_zone_id_list += [1371, 1382, 3205, 3619, 3621, 3622, 3198, 16375, 214845]
+
+# extras from relations / intersections
+port_zone_id_list += [16897, 195971, 18437, 197510, 17159, 18693, 18059, 17814, 18455, 19486, 17438, 18490, 17727, 195648, 186432, 212674, 197184, 17362, 18259, 187480, 196448, 17383, 18412, 17911, 18298, 17916, 18301]
+
+port_zone_id_list += [14713, 2172]
+
+port_zone_id_list += [18631, 13165, 13164]
+
+port_zone_id_list += [16273, 17022]
+
+len(port_zone_id_list)
 # -
 
 # Run
@@ -1063,7 +1129,7 @@ gdf_PG_ports = read_PG_ports(port_list = port_zone_id_list)
 gdf_MT_ports = read_mt_ports()
 #Terminals
 df_PG_terminals = read_PG_terminals(port_list = port_zone_id_list)
-df_PG_terminals_basic = df_PG_terminals[['terminal_id', 'terminal_name', 'port_id']]
+df_PG_terminals_basic = df_PG_terminals[['terminal_id', 'terminal_name', 'port_id']].drop_duplicates() #may have duplicates from multiple rows per smdg
 df_MT_terminals_basic = read_mt_terminals()
 #Berths
 gdf_PG_berths = read_PG_berths(port_list = port_zone_id_list) 
@@ -1078,10 +1144,14 @@ print('')
 #Quality errors
 df_errors = read_errors()
 #Name check
-df_name_check = name_check() #bookmark
+df_name_check = name_check() 
 
+# MT ports intersecting with port_zone_id_list but are not included ( = not matched with any PG port of list)
+df_mt_ports_inter = mt_ports_intersecting_not_included(port_zone_id_list)
+print('Matched zone ids', list(df_mt_ports_inter[~df_mt_ports_inter['matched_zone_id'].isna()]['matched_zone_id']))
+df_mt_ports_inter
 
-# Names trimmed
+# Names trimmed #bookmark
 df_name_check[df_name_check['name_trimmed']]
 # Optional: export names for eye passthrough
 #df_name_check.to_excel("name_check.xlsx", index=False)
@@ -1090,7 +1160,10 @@ df_name_check[df_name_check['name_trimmed']]
 df_errors.groupby(['error_class', 'error']).count()[['zone_id']].reset_index()
 
 # show errors
-df_errors[df_errors['error_class']=='Improvement'][['zone_id', 'zone_name', 'zone_type_name', 'error']]
+df_errors[df_errors['error_class']=='Critical'][['zone_id', 'zone_name', 'zone_type_name', 'error']]
+
+# show errors
+df_errors[df_errors['error']=='Vertex count 10 or more'][['zone_id', 'zone_name', 'zone_type_name', 'error']]
 
 # Split/prepare dataframes per handling type
 #Ports
@@ -1126,25 +1199,16 @@ print(len(df_alt_names_to_delete), 'alt-names')
 print(len(df_terminals_basic_to_delete), 'terminals')
 print(len(gdf_berths_to_delete), 'berths')
 
-list(gdf_PG_ports[gdf_PG_ports['port_id'].isin(gdf_ports_to_update['port_id'])]['zone_id'])
-
-df_terminals_basic_to_update
-
-gdf_berths_to_update
+gdf_berths_to_delete
 
 # +
-# check berths to be deleted of related port of anch of port...
-df_temp = gdf_berths_to_update[['berth_id', 'port_id']].merge(gdf_PG_ports[['zone_id', 'port_id', 'related_zone_anch_id', 'related_zone_port_id']], on='port_id').merge(gdf_PG_ports[['zone_id', 'related_zone_anch_id', 'related_zone_port_id']], on = 'related_zone_anch_id')
-
-df_temp['zone_id_y'].value_counts()
-
-
-# +
-# check anch relations differences
+# check anch relations differences  #bookmark
 df1 = gdf_MT_ports[['port_id', 'port_name', 'port_type', 'related_anch_id', 'related_port_id']].rename(columns={'related_anch_id':'MT_rel_anch'})
 df2 = gdf_ports_to_update[['port_id', 'port_name', 'port_type', 'related_anch_id', 'related_port_id']]
+df3 = gdf_PG_ports[['port_id', 'zone_id', 'zone_name', 'related_zone_anch_id', 'related_zone_port_id']]
 
 df_merged = df1.merge(df2, on='port_id')
+df_merged = df_merged.merge(df3, on='port_id')
 df_merged = df_merged.fillna(-1)
 
 df_merged[(df_merged['MT_rel_anch']!=df_merged['related_anch_id'])|(df_merged['related_port_id_x']!=df_merged['related_port_id_y'])]
@@ -1157,11 +1221,17 @@ df_merged = df1.merge(df2, on='port_id')
 df_merged = df_merged.fillna(-1)
 
 df_merged[df_merged['timezone_x']!=df_merged['timezone_y']][['port_id', 'port_name_x', 'timezone_x', 'timezone_y']]
-# -
 
+# +
 # handle log
 df_log = log_dataset(write=False, write_no_diff=True, comments='pending execution')
 df_log.groupby(['mt_table', 'statement']).count()['mt_id'].reset_index()
+
+# Optinal: export counts to excel
+#df_log.groupby(['mt_table', 'statement']).count()['mt_id'].reset_index().to_excel('log_counts.xlsx')
+# -
+
+
 
 # sql parts and combine
 # Pending? check_next_id 
@@ -1185,11 +1255,10 @@ print('Output characters:', len(final_sql))
 
 # +
 #print(final_sql)
-
-# +
-#Export
-#save_sql(final_sql, instance, lines_per_part=1000)
 # -
+
+#Export
+save_sql(final_sql, instance, lines_per_part=1000)
 
 
 
